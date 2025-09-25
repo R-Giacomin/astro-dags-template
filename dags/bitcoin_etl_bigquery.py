@@ -107,7 +107,6 @@ def fetch_and_to_gbq():
     start_date=pendulum.datetime(2025, 9, 17, tz="UTC"),
     catchup=True,
     max_active_runs=1,
-    concurrency=2,
     owner_links={
         "Alex Lopes": "mailto:alexlopespereira@gmail.com",
         "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
