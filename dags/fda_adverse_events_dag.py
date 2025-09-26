@@ -1,5 +1,5 @@
 import pendulum
-from datetime import timedelta
+from datetime import timedelta, datetime # Adicionada a importação de datetime
 
 # Importações do Airflow
 from airflow.decorators import dag, task
@@ -54,8 +54,12 @@ def fda_adverse_events_dag():
         data_interval_start = kwargs['data_interval_start']
         data_interval_end = kwargs['data_interval_end']
 
-        # 1. Garante que a data de início nunca seja anterior a 2025-01-01
-        start_date_dt = max(data_interval_start, API_DATE_START_CONSTRAINT)
+        # CORREÇÃO APLICADA AQUI: Convertemos para datetime padrão ou usamos uma comparação direta
+        # Garante que a data de início nunca seja anterior a 2025-01-01 (API_DATE_START_CONSTRAINT)
+        if data_interval_start < API_DATE_START_CONSTRAINT:
+            start_date_dt = API_DATE_START_CONSTRAINT
+        else:
+            start_date_dt = data_interval_start
         
         # Formato de data exigido pela API: AAAAMMDD
         start_date = start_date_dt.strftime('%Y%m%d')
