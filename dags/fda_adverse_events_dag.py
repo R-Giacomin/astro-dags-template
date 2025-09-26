@@ -1,16 +1,15 @@
 import pendulum
 from datetime import timedelta, datetime 
 
-# Importações do Airflow
+# Importações ESSENCIAIS DO AIRFLOW (devem ficar no topo)
 from airflow.decorators import dag, task
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
-# Bibliotecas para processamento de dados e requisições 
-import requests
-import pandas as pd
-# Removido 'import pandas_gbq' - Não é mais necessário
+# ##################################################################
+# IMPORTAÇÕES PESADAS (pandas, requests) SERÃO MOVIDAS PARA DENTRO
+# DAS TAREFAS @task PARA EVITAR ERROS DE PARSING DO SCHEDULER.
+# ##################################################################
 
-# ====== CONFIGURAÇÃO GERAL ======
 # Variáveis de Configuração do Usuário
 GCP_PROJECT = "gen-lang-client-0010767843" 
 BQ_DATASET  = "fda"     
@@ -29,7 +28,6 @@ API_DATE_START_CONSTRAINT = pendulum.datetime(2025, 1, 1, tz="UTC")
 # =================================
 
 @dag(
-    # Mantemos o ID da DAG consistente:
     dag_id='fda_adverse_events_weekly', 
     start_date=API_DATE_START_CONSTRAINT, 
     schedule='@weekly', 
@@ -46,11 +44,15 @@ def fda_adverse_events_dag():
     """DAG para buscar dados da API openFDA e carregar no BigQuery."""
 
     @task
-    def fetch_fda_data(**kwargs) -> pd.DataFrame:
+    def fetch_fda_data(**kwargs):
         """
         Busca dados de eventos adversos da API openFDA para o intervalo da execução.
         Implementa paginação e normaliza o JSON para um DataFrame plano.
         """
+        # IMPORTAÇÕES LOCAIS: Garante que o scheduler não falhe no parsing
+        import requests
+        import pandas as pd
+        
         data_interval_start = kwargs['data_interval_start']
         data_interval_end = kwargs['data_interval_end']
 
@@ -129,7 +131,10 @@ def fda_adverse_events_dag():
     def load_to_bigquery(df: pd.DataFrame):
         """
         Carrega o DataFrame para o Google BigQuery usando o BigQueryHook.
+        A importação de Pandas é feita aqui também para garantir o acesso ao tipo DataFrame.
         """
+        import pandas as pd
+        
         if df.empty:
             print("DataFrame vazio. Nenhuma ação será tomada no BigQuery.")
             return
@@ -139,15 +144,12 @@ def fda_adverse_events_dag():
         hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
         
         try:
-            # CORREÇÃO AQUI: Uso de run_load_dataframe para evitar a dependência complexa do pandas-gbq
             hook.run_load_dataframe(
                 dataframe=df,
                 dest_table=f'{BQ_DATASET}.{BQ_TABLE}',
                 project_id=GCP_PROJECT,
                 if_exists='append', 
-                # O parâmetro replace é 'WRITE_APPEND' para if_exists='append'
-                # O hook lida com a criação da tabela e o carregamento do DataFrame.
-                autodetect=True, # Tenta detectar o esquema
+                autodetect=True,
             )
             print("Carga para o BigQuery concluída com sucesso.")
 
