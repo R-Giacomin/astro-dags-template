@@ -25,7 +25,7 @@ API_MAX_RECORDS = 10000 # Limite máximo de registros por consulta da API
     ### DAG de Eventos Adversos da FDA
 
     Esta DAG recupera dados semanais de eventos adversos a medicamentos da API openFDA
-    e os carrega no Google BigQuery.
+    e os carrega no BigQuery.
 
     **Funcionalidades:**
     - **Execução Semanal:** A DAG é executada uma vez por semana.
