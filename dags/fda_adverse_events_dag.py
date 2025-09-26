@@ -1,5 +1,5 @@
 import pendulum
-from datetime import timedelta, datetime # Adicionada a importação de datetime
+from datetime import timedelta, datetime 
 
 # Importações do Airflow
 from airflow.decorators import dag, task
@@ -8,7 +8,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 # Bibliotecas para processamento de dados e requisições 
 import requests
 import pandas as pd
-import pandas_gbq # Necessário para o método df.to_gbq()
+# Removido 'import pandas_gbq' - Não é mais necessário
 
 # ====== CONFIGURAÇÃO GERAL ======
 # Variáveis de Configuração do Usuário
@@ -20,8 +20,8 @@ GCP_CONN_ID = "google_cloud_default" # ID da Conexão do Airflow
 
 # Constantes da API
 API_BASE_URL = "https://api.fda.gov/drug/event.json"
-API_LIMIT = 100         # Máximo de registros por página
-API_MAX_RECORDS = 10000 # Limite máximo de registros por consulta da API (100 * 100 iterações)
+API_LIMIT = 100         
+API_MAX_RECORDS = 10000 
 
 # Data de início mais antiga permitida (01/01/2025)
 API_DATE_START_CONSTRAINT = pendulum.datetime(2025, 1, 1, tz="UTC") 
@@ -29,16 +29,17 @@ API_DATE_START_CONSTRAINT = pendulum.datetime(2025, 1, 1, tz="UTC")
 # =================================
 
 @dag(
-    dag_id='fda_adverse_events_weekly',
-    start_date=API_DATE_START_CONSTRAINT, # A DAG só começa a rodar a partir desta data
-    schedule='@weekly', # Executa uma vez por semana
-    catchup=True, # Permite que a DAG execute retroativamente desde o start_date
+    # Mantemos o ID da DAG consistente:
+    dag_id='fda_adverse_events_weekly', 
+    start_date=API_DATE_START_CONSTRAINT, 
+    schedule='@weekly', 
+    catchup=True,
     tags=['fda', 'bigquery', 'api'],
     doc_md="""
     ### DAG de Eventos Adversos da FDA (Carregamento Semanal)
 
     Esta DAG recupera dados semanais de eventos adversos a medicamentos da API openFDA
-    e os carrega no Google BigQuery. Implementa paginação e normalização de JSON.
+    e os carrega no Google BigQuery usando o método nativo BigQueryHook.
     """
 )
 def fda_adverse_events_dag():
@@ -48,14 +49,12 @@ def fda_adverse_events_dag():
     def fetch_fda_data(**kwargs) -> pd.DataFrame:
         """
         Busca dados de eventos adversos da API openFDA para o intervalo da execução.
-        Implementa paginação e normaliza o JSON para um DataFrame plano, pronto para o BQ.
+        Implementa paginação e normaliza o JSON para um DataFrame plano.
         """
-        # Captura o intervalo de tempo definido pelo Airflow para a execução semanal
         data_interval_start = kwargs['data_interval_start']
         data_interval_end = kwargs['data_interval_end']
 
-        # CORREÇÃO APLICADA AQUI: Convertemos para datetime padrão ou usamos uma comparação direta
-        # Garante que a data de início nunca seja anterior a 2025-01-01 (API_DATE_START_CONSTRAINT)
+        # Garante que a data de início nunca seja anterior a 2025-01-01
         if data_interval_start < API_DATE_START_CONSTRAINT:
             start_date_dt = API_DATE_START_CONSTRAINT
         else:
@@ -72,7 +71,7 @@ def fda_adverse_events_dag():
         total_records_fetched = 0
 
         while True:
-            # 2. Verifica o limite de paginação (10.000 registros)
+            # Verifica o limite de paginação (10.000 registros)
             if skip >= API_MAX_RECORDS:
                 print(f"Atingido o limite de paginação da API openFDA ({API_MAX_RECORDS} registros) para este período.")
                 break
@@ -86,22 +85,20 @@ def fda_adverse_events_dag():
             }
 
             try:
-                # Realiza a requisição
                 response = requests.get(API_BASE_URL, params=params, timeout=30)
-                response.raise_for_status() # Verifica erros HTTP
+                response.raise_for_status() 
                 data = response.json()
 
                 results = data.get('results', [])
                 
                 if not results:
-                    print("Não foram encontrados mais resultados para este período. Finalizando a busca.")
                     break
 
                 all_results.extend(results)
                 total_records_fetched += len(results)
                 print(f"Registros buscados nesta página: {len(results)}. Total acumulado: {total_records_fetched}")
 
-                # 3. Prepara para a próxima página ou finaliza
+                # Prepara para a próxima página ou finaliza
                 if len(results) < API_LIMIT:
                     break
                 
@@ -119,19 +116,19 @@ def fda_adverse_events_dag():
         if not all_results:
             return pd.DataFrame() 
 
-        # 4. NORMALIZAÇÃO: Converte o JSON aninhado em um DataFrame plano
+        # NORMALIZAÇÃO: Converte o JSON aninhado em um DataFrame plano
         df = pd.json_normalize(all_results, errors='ignore')
 
-        # Converte a coluna de data para o formato datetime para garantir compatibilidade com BQ
+        # Converte a coluna de data para o formato datetime
         if 'receiveddate' in df.columns:
             df['receiveddate'] = pd.to_datetime(df['receiveddate'], format='%Y%m%d', errors='coerce')
             
-        return df # Retornado para ser salvo automaticamente no XCom
+        return df 
 
     @task
     def load_to_bigquery(df: pd.DataFrame):
         """
-        Carrega o DataFrame, que foi normalizado, para a tabela do Google BigQuery.
+        Carrega o DataFrame para o Google BigQuery usando o BigQueryHook.
         """
         if df.empty:
             print("DataFrame vazio. Nenhuma ação será tomada no BigQuery.")
@@ -142,14 +139,15 @@ def fda_adverse_events_dag():
         hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
         
         try:
-            # df.to_gbq é usado para carregamento robusto
-            df.to_gbq(
-                destination_table=f'{BQ_DATASET}.{BQ_TABLE}',
+            # CORREÇÃO AQUI: Uso de run_load_dataframe para evitar a dependência complexa do pandas-gbq
+            hook.run_load_dataframe(
+                dataframe=df,
+                dest_table=f'{BQ_DATASET}.{BQ_TABLE}',
                 project_id=GCP_PROJECT,
-                if_exists='append', # Adiciona os dados se a tabela já existir
-                credentials=hook.get_credentials(),
-                progress_bar=False,
-                chunksize=10000 
+                if_exists='append', 
+                # O parâmetro replace é 'WRITE_APPEND' para if_exists='append'
+                # O hook lida com a criação da tabela e o carregamento do DataFrame.
+                autodetect=True, # Tenta detectar o esquema
             )
             print("Carga para o BigQuery concluída com sucesso.")
 
