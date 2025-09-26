@@ -24,15 +24,115 @@ DEFAULT_ARGS = {
 
 @task
 def fetch_and_load_fda_data():
-    # ... (seu código existente aqui - mantém igual) ...
+    """
+    Busca dados de eventos adversos da API openFDA para o intervalo da execução,
+    implementa paginação e carrega diretamente no BigQuery usando df.to_gbq().
+    """
+    ctx = get_current_context()
+
+    # 1. Definição do Período de Busca (Semana Anterior)
+    data_interval_start = ctx['data_interval_start']
+    data_interval_end = ctx['data_interval_end']
+    
+    # Garante que a data de início nunca seja anterior a 2025-01-01
+    API_DATE_START_CONSTRAINT = pendulum.datetime(2025, 1, 1, tz="UTC")
+    if data_interval_start < API_DATE_START_CONSTRAINT:
+        start_date_dt = API_DATE_START_CONSTRAINT
+    else:
+        start_date_dt = data_interval_start
+    
+    # Formato de data exigido pela API: AAAAMMDD
+    start_date = start_date_dt.strftime('%Y%m%d')
+    end_date = data_interval_end.strftime('%Y%m%d')
+
+    print(f"Buscando dados no intervalo: {start_date} até {end_date}")
+
+    all_results = []
+    skip = 0
+    total_records_fetched = 0
+
+    # 2. Loop de Paginação (Extração)
+    while True:
+        if skip >= API_MAX_RECORDS:
+            print(f"Atingido o limite de paginação da API openFDA ({API_MAX_RECORDS} registros) para este período.")
+            break
+
+        search_query = f'receiveddate:[{start_date}+TO+{end_date}]'
+        params = {
+            'search': search_query,
+            'sort': 'receiveddate:desc', 
+            'limit': API_LIMIT,
+            'skip': skip
+        }
+
+        try:
+            response = requests.get(API_BASE_URL, params=params, timeout=60)
+            response.raise_for_status() 
+            data = response.json()
+
+            results = data.get('results', [])
+            
+            if not results:
+                break
+
+            all_results.extend(results)
+            total_records_fetched += len(results)
+            print(f"Registros buscados nesta página: {len(results)}. Total acumulado: {total_records_fetched}")
+
+            if len(results) < API_LIMIT:
+                break
+            
+            skip += API_LIMIT
+
+        except requests.exceptions.RequestException as e:
+            print(f"Erro ao chamar a API openFDA na requisição com skip={skip}: {e}")
+            raise
+        except ValueError:
+            print("Erro ao decodificar a resposta JSON da API.")
+            raise
+
+    print(f"Busca finalizada. Total de {len(all_results)} registros recuperados.")
+
+    if not all_results:
+        print("Nenhum dado retornado. Finalizando.")
+        return 
+
+    # 3. Processamento e Normalização
+    df = pd.json_normalize(all_results, errors='ignore')
+
+    if 'receiveddate' in df.columns:
+        df['receiveddate'] = pd.to_datetime(df['receiveddate'], format='%Y%m%d', errors='coerce')
+    
+    # 4. Carregamento para o BigQuery usando df.to_gbq()
+    
+    # Obtém credenciais da Conexão do Airflow
+    bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+    credentials = bq_hook.get_credentials()
+    destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+
+    try:
+        # Carregamento robusto com pandas-gbq (df.to_gbq)
+        df.to_gbq(
+            destination_table=destination_table,
+            project_id=GCP_PROJECT,
+            if_exists="append",
+            credentials=credentials,
+            location=BQ_LOCATION,
+            progress_bar=False,
+        )
+        print(f"Carga para o BigQuery concluída com sucesso. {len(df)} linhas carregadas.")
+
+    except Exception as e:
+        print(f"Erro ao carregar dados para o BigQuery: {e}")
+        raise
 
 @dag(
     default_args=DEFAULT_ARGS,
     dag_id='fda_adverse_events_weekly',
-    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),  # CORRIGIDO
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     schedule='@weekly',
     catchup=True,
-    max_active_runs=1,  # ADICIONADO
+    max_active_runs=1,
     tags=['fda', 'bigquery', 'api'],
 )
 def fda_adverse_events_dag():
