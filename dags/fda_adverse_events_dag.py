@@ -9,7 +9,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 # Configurações
 GCP_PROJECT = "gen-lang-client-0010767843" 
 BQ_DATASET  = "fda"     
-BQ_TABLE    = "fda_data"
+BQ_TABLE    = "fda_aspirin_events"
 BQ_LOCATION = "US"      
 GCP_CONN_ID = "google_cloud_default"
 
@@ -25,93 +25,129 @@ DEFAULT_ARGS = {
 @task
 def fetch_and_load_fda_data():
     """
-    Busca dados de eventos adversos da API openFDA para o intervalo da execução,
-    implementa paginação e carrega diretamente no BigQuery usando df.to_gbq().
+    Busca dados de eventos adversos para Aspirin da API openFDA.
     """
     ctx = get_current_context()
 
-    # 1. Definição do Período de Busca (Semana Anterior)
+    # 1. Definir período de busca (usando receivedate em vez de receiveddate)
     data_interval_start = ctx['data_interval_start']
     data_interval_end = ctx['data_interval_end']
     
-    # Garante que a data de início nunca seja anterior a 2025-01-01
-    API_DATE_START_CONSTRAINT = pendulum.datetime(2025, 1, 1, tz="UTC")
-    if data_interval_start < API_DATE_START_CONSTRAINT:
-        start_date_dt = API_DATE_START_CONSTRAINT
+    print(f"📅 Data Interval Start: {data_interval_start}")
+    print(f"📅 Data Interval End: {data_interval_end}")
+    
+    # Ajustar para período válido (a API pode não ter dados muito recentes)
+    if data_interval_start.year > 2024:
+        # Usar 2023 se a data for muito recente
+        start_date_dt = pendulum.datetime(2023, 1, 1, tz="UTC")
+        end_date_dt = pendulum.datetime(2023, 12, 31, tz="UTC")
     else:
         start_date_dt = data_interval_start
+        end_date_dt = data_interval_end
     
-    # Formato de data exigido pela API: AAAAMMDD
+    # Formato de data: AAAAMMDD
     start_date = start_date_dt.strftime('%Y%m%d')
-    end_date = data_interval_end.strftime('%Y%m%d')
+    end_date = end_date_dt.strftime('%Y%m%d')
 
-    print(f"Buscando dados no intervalo: {start_date} até {end_date}")
+    print(f"🔍 Buscando dados do Aspirin no intervalo: {start_date} até {end_date}")
 
     all_results = []
     skip = 0
     total_records_fetched = 0
 
-    # 2. Loop de Paginação (Extração)
+    # 2. Loop de Paginação
     while True:
         if skip >= API_MAX_RECORDS:
-            print(f"Atingido o limite de paginação da API openFDA ({API_MAX_RECORDS} registros) para este período.")
+            print(f"📊 Atingido o limite de {API_MAX_RECORDS} registros.")
             break
 
-        search_query = f'receiveddate:[{start_date}+TO+{end_date}]'
+        # QUERY QUE FUNCIONOU: Aspirin + intervalo de data
+        search_query = f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]'
+        
         params = {
             'search': search_query,
-            'sort': 'receiveddate:desc', 
             'limit': API_LIMIT,
-            'skip': skip
+            'skip': skip,
+            'sort': 'receivedate:desc'
         }
 
         try:
+            print(f"📡 Fazendo requisição {skip//API_LIMIT + 1}...")
+            print(f"🔍 Query: {search_query}")
+            
             response = requests.get(API_BASE_URL, params=params, timeout=60)
-            response.raise_for_status() 
+            print(f"📊 Status Code: {response.status_code}")
+            
+            if response.status_code != 200:
+                print(f"❌ Erro HTTP {response.status_code}")
+                response.raise_for_status()
+            
             data = response.json()
+
+            # Verificar se há erro
+            if 'error' in data:
+                error_msg = data['error']
+                print(f"⚠️ Erro da API: {error_msg}")
+                if error_msg.get('code') == 'NOT_FOUND':
+                    print("ℹ️ Nenhum dado encontrado para os critérios.")
+                    break
+                else:
+                    raise Exception(f"API Error: {error_msg}")
 
             results = data.get('results', [])
             
             if not results:
+                print("✅ Nenhum resultado adicional encontrado.")
                 break
 
             all_results.extend(results)
             total_records_fetched += len(results)
-            print(f"Registros buscados nesta página: {len(results)}. Total acumulado: {total_records_fetched}")
+            print(f"📥 Página {skip//API_LIMIT + 1}: {len(results)} registros. Total: {total_records_fetched}")
 
             if len(results) < API_LIMIT:
+                print("✅ Última página alcançada.")
                 break
             
             skip += API_LIMIT
 
-        except requests.exceptions.RequestException as e:
-            print(f"Erro ao chamar a API openFDA na requisição com skip={skip}: {e}")
-            raise
-        except ValueError:
-            print("Erro ao decodificar a resposta JSON da API.")
-            raise
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ Erro HTTP: {e}")
+            if hasattr(e, 'response'):
+                print(f"🔍 Response: {e.response.text[:500]}...")
+            break
+        except Exception as e:
+            print(f"❌ Erro: {e}")
+            break
 
-    print(f"Busca finalizada. Total de {len(all_results)} registros recuperados.")
+    print(f"🎯 Busca finalizada. Total de {len(all_results)} registros do Aspirin.")
 
     if not all_results:
-        print("Nenhum dado retornado. Finalizando.")
-        return 
+        print("⚠️ Nenhum dado retornado para o Aspirin neste período.")
+        return "No aspirin data found"
 
-    # 3. Processamento e Normalização
+    # 3. Processamento dos dados
     df = pd.json_normalize(all_results, errors='ignore')
+    print(f"📊 DataFrame criado com {len(df)} linhas e {len(df.columns)} colunas")
 
-    if 'receiveddate' in df.columns:
-        df['receiveddate'] = pd.to_datetime(df['receiveddate'], format='%Y%m%d', errors='coerce')
-    
-    # 4. Carregamento para o BigQuery usando df.to_gbq()
-    
-    # Obtém credenciais da Conexão do Airflow
-    bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-    credentials = bq_hook.get_credentials()
-    destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+    # Mostrar estrutura dos dados
+    print(f"🏷️ Colunas encontradas: {list(df.columns)[:10]}...")  # Primeiras 10 colunas
 
+    # Processar datas se existirem
+    date_columns = [col for col in df.columns if 'date' in col.lower()]
+    for col in date_columns:
+        if col in df.columns and df[col].notna().any():
+            try:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+                print(f"🗓️ Processada coluna de data: {col}")
+            except:
+                print(f"⚠️ Não foi possível processar a data da coluna: {col}")
+
+    # 4. Carregamento para BigQuery
     try:
-        # Carregamento robusto com pandas-gbq (df.to_gbq)
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+        credentials = bq_hook.get_credentials()
+        destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+
         df.to_gbq(
             destination_table=destination_table,
             project_id=GCP_PROJECT,
@@ -120,22 +156,23 @@ def fetch_and_load_fda_data():
             location=BQ_LOCATION,
             progress_bar=False,
         )
-        print(f"Carga para o BigQuery concluída com sucesso. {len(df)} linhas carregadas.")
+        print(f"✅ Carga para BigQuery concluída! {len(df)} linhas do Aspirin carregadas.")
+        return f"Successfully loaded {len(df)} aspirin records"
 
     except Exception as e:
-        print(f"Erro ao carregar dados para o BigQuery: {e}")
+        print(f"❌ Erro no BigQuery: {e}")
         raise
 
 @dag(
     default_args=DEFAULT_ARGS,
-    dag_id='fda_adverse_events_weekly',
-    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    dag_id='fda_aspirin_events_weekly',
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),  # Começar em 2023
     schedule='@weekly',
     catchup=True,
     max_active_runs=1,
-    tags=['fda', 'bigquery', 'api'],
+    tags=['fda', 'aspirin', 'bigquery', 'api'],
 )
-def fda_adverse_events_dag():
+def fda_aspirin_events_dag():
     fetch_and_load_fda_data()
 
-dag = fda_adverse_events_dag()
+dag = fda_aspirin_events_dag()
