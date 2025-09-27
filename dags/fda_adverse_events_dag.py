@@ -23,158 +23,93 @@ DEFAULT_ARGS = {
 
 def extract_specific_fields(record):
     """
-    Extrai os campos específicos de cada registro da FDA.
+    Extrai campos relevantes de um registro da FDA.
     """
     try:
-        # Campos básicos
-        safetyreportid = record.get('safetyreportid')
-        receivedate = record.get('receivedate')
-        serious = record.get('serious')
-        
-        # Campos aninhados - paciente
-        patient_sex = None
-        if 'patient' in record and record['patient']:
-            patient_sex = record['patient'].get('patientsex')
-        
-        # Campos aninhados - reações (pegar a primeira reação)
-        reactionmeddrapt = None
-        if 'patient' in record and record['patient']:
-            if 'reaction' in record['patient'] and record['patient']['reaction']:
-                first_reaction = record['patient']['reaction'][0]
-                reactionmeddrapt = first_reaction.get('reactionmeddrapt')
-        
         return {
-            'safetyreportid': safetyreportid,
-            'receivedate': receivedate,
-            'serious': serious,
-            'patient_patientsex': patient_sex,
-            'reactionmeddrapt': reactionmeddrapt
+            "safetyreportid": str(record.get("safetyreportid", "")),
+            "receivedate": record.get("receivedate"),  # será convertido depois
+            "serious": int(record.get("serious", 0)) if record.get("serious") else 0,
+            "patient_patientsex": int(record.get("patient", {}).get("patientsex", 0))
+                if "patient" in record else 0,
+            "reactionmeddrapt": (
+                record.get("patient", {})
+                      .get("reaction", [{}])[0]
+                      .get("reactionmeddrapt", "")
+            )
         }
     except Exception as e:
-        print(f"❌ Erro ao extrair campos do registro: {e}")
+        print(f"❌ Erro ao extrair campos: {e}")
         return None
 
 @task
 def fetch_and_load_fda_data():
     ctx = get_current_context()
-
-    # Usar a data da execução do DAG
     target_date = ctx["data_interval_start"]
 
     start_date = target_date.strftime('%Y%m%d')
     end_date   = target_date.strftime('%Y%m%d')
 
-    print(f"🔍 Buscando dados do Aspirin para o dia: {start_date}")
+    print(f"🔍 Buscando dados de Aspirin para o dia: {start_date}")
 
     all_results = []
     skip = 0
     max_records = 500
 
-    # 2. Loop de Paginação para um único dia
     while True:
         if skip >= max_records:
-            print(f"📊 Atingido o limite de {max_records} registros.")
             break
 
-        # Query para UM DIA específico
-        search_query = f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]'
-        
         params = {
-            'search': search_query,
-            'limit': 50,
-            'skip': skip
+            "search": f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]',
+            "limit": 50,
+            "skip": skip
         }
 
         try:
-            print(f"📡 Fazendo requisição {skip//50 + 1}...")
-            
             response = requests.get(API_BASE_URL, params=params, timeout=30)
-            print(f"📊 Status Code: {response.status_code}")
-            
-            if response.status_code == 500:
-                print("❌ Erro 500 - Tentando com abordagem mais simples...")
-                break
-                    
-            elif response.status_code != 200:
-                print(f"❌ Erro HTTP {response.status_code}")
-                break
-            
+            print(f"📡 Request {skip//50 + 1}, status {response.status_code}")
+
             data = response.json()
+            results = data.get("results", [])
 
-            if 'error' in data:
-                error_msg = data['error']
-                print(f"⚠️ Erro da API: {error_msg}")
-                break
+            print(f"🔎 {len(results)} registros nesta página")
 
-            results = data.get('results', [])
-            
             if not results:
-                print("✅ Nenhum resultado adicional encontrado.")
                 break
 
             all_results.extend(results)
-            print(f"📥 Página {skip//50 + 1}: {len(results)} registros. Total: {len(all_results)}")
 
             if len(results) < 50:
-                print("✅ Última página alcançada.")
                 break
-            
+
             skip += 50
 
         except Exception as e:
-            print(f"❌ Erro: {e}")
+            print(f"❌ Erro na requisição: {e}")
             break
 
-    print(f"🎯 Busca finalizada. Total de {len(all_results)} registros brutos.")
-
-    # CORREÇÃO CRÍTICA: SEMPRE definir a variável df
-    df = pd.DataFrame()  # Inicializar vazio
+    print(f"🎯 Total bruto coletado: {len(all_results)} registros")
 
     if not all_results:
-        print("⚠️ Nenhum dado retornado. Criando dados de teste...")
-        
-        # Criar dados de teste
-        test_data = [
-            {
-                'safetyreportid': 'TEST_001',
-                'receivedate': start_date,
-                'serious': 1,
-                'patient_patientsex': 1,
-                'reactionmeddrapt': 'Headache'
-            }
-        ]
-        df = pd.DataFrame(test_data)
-        print("🧪 Usando dados de teste para validar o pipeline.")
-        
-    else:
-        # Processar dados reais
-        extracted_data = []
-        for record in all_results:
-            extracted_record = extract_specific_fields(record)
-            if extracted_record:
-                extracted_data.append(extracted_record)
-        
-        if extracted_data:
-            df = pd.DataFrame(extracted_data)
-            print(f"📊 Extraídos {len(df)} registros com colunas específicas.")
-        else:
-            print("⚠️ Nenhum dado extraído. Criando dados de teste...")
-            test_data = [{
-                'safetyreportid': 'TEST_FALLBACK',
-                'receivedate': start_date,
-                'serious': 0,
-                'patient_patientsex': 0,
-                'reactionmeddrapt': 'Fallback'
-            }]
-            df = pd.DataFrame(test_data)
+        print("⚠️ Nenhum dado retornado para esse dia.")
+        return "No data"
 
-    # CORREÇÃO: Verificar se df foi definido e não está vazio
-    if df is None or df.empty:
-        print("❌ DataFrame não foi criado corretamente. Criando DataFrame vazio...")
-        df = pd.DataFrame(columns=[
-            'safetyreportid', 'receivedate', 'serious', 
-            'patient_patientsex', 'reactionmeddrapt'
-        ])
+    extracted_data = [
+        extract_specific_fields(record)
+        for record in all_results
+        if extract_specific_fields(record)
+    ]
+
+    df = pd.DataFrame(extracted_data)
+
+    # Converter tipos
+    if "receivedate" in df.columns:
+        df["receivedate"] = pd.to_datetime(df["receivedate"], format="%Y%m%d", errors="coerce")
+
+    print("👀 Preview do DataFrame:")
+    print(df.head())
+    print(df.dtypes)
 
     # Processar e carregar para BigQuery
     print("👀 Preview do DataFrame:")
