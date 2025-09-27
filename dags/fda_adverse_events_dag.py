@@ -56,19 +56,15 @@ def extract_specific_fields(record):
 
 @task
 def fetch_and_load_fda_data():
-    """
-    Busca dados de eventos adversos para Aspirin - UM DIA POR VEZ.
-    """
     ctx = get_current_context()
 
-    # 1. Usar APENAS UM DIA específico - 01/09/2025
-    target_date = pendulum.datetime(2025, 9, 1, tz="UTC")
-    
-    # Formato de data: AAAAMMDD (mesmo dia para início e fim)
-    start_date = target_date.strftime('%Y%m%d')
-    end_date = target_date.strftime('%Y%m%d')
+    # Usar a data da execução do DAG
+    target_date = ctx["data_interval_start"]
 
-    print(f"🔍 Buscando dados do Aspirin para UM DIA: {start_date}")
+    start_date = target_date.strftime('%Y%m%d')
+    end_date   = target_date.strftime('%Y%m%d')
+
+    print(f"🔍 Buscando dados do Aspirin para o dia: {start_date}")
 
     all_results = []
     skip = 0
@@ -284,7 +280,7 @@ def fetch_and_load_fda_data():
 @dag(
     default_args=DEFAULT_ARGS,
     dag_id='fda_aspirin_daily',
-    start_date=pendulum.datetime(2025, 9, 1, tz="UTC"),
+    start_date=pendulum.datetime(2024, 10, 1, tz="UTC"),  # <-- aqui muda
     schedule='@daily',
     catchup=True,
     max_active_runs=1,
