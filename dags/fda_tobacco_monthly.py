@@ -20,15 +20,6 @@ default_args = {
     "retries": 2,
 }
 
-@dag(
-    dag_id="fda_tobacco_monthly",
-    default_args=default_args,
-    schedule="@monthly",
-    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
-    catchup=True,
-    max_active_runs=1,
-    tags=["fda", "tobacco", "api", "bigquery", "monthly"],
-)
 def fda_tobacco_dag():
 
     @task
@@ -134,5 +125,15 @@ def fda_tobacco_dag():
     raw_reports = fetch_tobacco_reports_by_month()
     process_and_load_to_bq(raw_reports)
 
+@dag(
+    dag_id="fda_tobaco_monthly",
+    default_args=default_args,
+    schedule="@monthly",
+    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
+    catchup=True,
+    max_active_runs=1,
+    tags=["fda", "tobacco", "api", "bigquery", "monthly"],
+)
 # ⚠️ IMPORTANTE: variável global deve se chamar EXATAMENTE 'dag'
+
 dag = fda_tobacco_dag()
