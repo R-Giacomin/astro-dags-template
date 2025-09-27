@@ -14,8 +14,7 @@ BQ_LOCATION = "US"
 GCP_CONN_ID = "google_cloud_default"
 
 API_BASE_URL = "https://api.fda.gov/drug/event.json"
-API_LIMIT = 100
-API_MAX_RECORDS = 10000
+API_LIMIT = 50  # Reduzido para evitar sobrecarga
 
 DEFAULT_ARGS = {
     "email_on_failure": True,
@@ -41,7 +40,6 @@ def extract_specific_fields(record):
         reactionmeddrapt = None
         if 'patient' in record and record['patient']:
             if 'reaction' in record['patient'] and record['patient']['reaction']:
-                # Pegar a primeira reação da lista
                 first_reaction = record['patient']['reaction'][0]
                 reactionmeddrapt = first_reaction.get('reactionmeddrapt')
         
@@ -59,69 +57,71 @@ def extract_specific_fields(record):
 @task
 def fetch_and_load_fda_data():
     """
-    Busca dados de eventos adversos para Aspirin da API openFDA.
+    Busca dados de eventos adversos para Aspirin - UM DIA POR VEZ.
     """
     ctx = get_current_context()
 
-    # 1. Definir período de busca MENOR (1 mês em vez de 1 ano)
-    data_interval_start = ctx['data_interval_start']
-    data_interval_end = ctx['data_interval_end']
+    # 1. Usar APENAS UM DIA específico - 01/09/2025
+    target_date = pendulum.datetime(2025, 9, 1, tz="UTC")
     
-    print(f"📅 Data Interval Start: {data_interval_start}")
-    print(f"📅 Data Interval End: {data_interval_end}")
-    
-    # Usar período menor para evitar erro 500
-    # Para teste, usar um mês específico de 2023
-    start_date_dt = pendulum.datetime(2023, 1, 1, tz="UTC")
-    end_date_dt = pendulum.datetime(2023, 1, 31, tz="UTC")  # Apenas janeiro de 2023
-    
-    # Formato de data: AAAAMMDD
-    start_date = start_date_dt.strftime('%Y%m%d')
-    end_date = end_date_dt.strftime('%Y%m%d')
+    # Formato de data: AAAAMMDD (mesmo dia para início e fim)
+    start_date = target_date.strftime('%Y%m%d')
+    end_date = target_date.strftime('%Y%m%d')
 
-    print(f"🔍 Buscando dados do Aspirin no intervalo: {start_date} até {end_date}")
+    print(f"🔍 Buscando dados do Aspirin para UM DIA: {start_date}")
 
     all_results = []
     skip = 0
-    total_records_fetched = 0
+    max_records = 500  # Limite máximo
 
-    # 2. Loop de Paginação com tratamento melhor de erros
+    # 2. Loop de Paginação para um único dia
     while True:
-        if skip >= 1000:  # Limitar para teste
-            print(f"📊 Atingido o limite de 1000 registros.")
+        if skip >= max_records:
+            print(f"📊 Atingido o limite de {max_records} registros.")
             break
 
-        # Query para Aspirin - intervalo menor
+        # Query para UM DIA específico
         search_query = f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]'
         
         params = {
             'search': search_query,
-            'limit': 50,  # Reduzir limite por página
+            'limit': API_LIMIT,
             'skip': skip
         }
 
         try:
-            print(f"📡 Fazendo requisição {skip//50 + 1}...")
+            print(f"📡 Fazendo requisição {skip//API_LIMIT + 1}...")
+            print(f"🔍 Query: {search_query}")
             
             response = requests.get(API_BASE_URL, params=params, timeout=30)
             print(f"📊 Status Code: {response.status_code}")
             
             if response.status_code == 500:
-                print("❌ Erro 500 da API - Intervalo muito grande ou muitos dados.")
-                print("💡 Tentando com intervalo ainda menor...")
+                print("❌ Erro 500 - Tentando com abordagem mais simples...")
                 
-                # Tentar com intervalo menor: uma semana
-                start_date_dt = pendulum.datetime(2023, 1, 1, tz="UTC")
-                end_date_dt = pendulum.datetime(2023, 1, 7, tz="UTC")
-                start_date = start_date_dt.strftime('%Y%m%d')
-                end_date = end_date_dt.strftime('%Y%m%d')
+                # Tentar sem filtro de data, apenas aspirin
+                search_query_simple = 'patient.drug.medicinalproduct:"aspirin"'
+                params_simple = {
+                    'search': search_query_simple,
+                    'limit': 10,  # Apenas 10 registros
+                    'skip': skip
+                }
                 
-                print(f"🔄 Novo intervalo: {start_date} até {end_date}")
-                continue  # Reiniciar o loop com novo intervalo
-                
+                response_simple = requests.get(API_BASE_URL, params=params_simple, timeout=30)
+                if response_simple.status_code == 200:
+                    data_simple = response_simple.json()
+                    results = data_simple.get('results', [])
+                    if results:
+                        all_results.extend(results)
+                        print(f"📥 Encontrados {len(results)} registros (abordagem simples).")
+                        break
+                else:
+                    print("❌ Abordagem simples também falhou.")
+                    break
+                    
             elif response.status_code != 200:
                 print(f"❌ Erro HTTP {response.status_code}")
-                response.raise_for_status()
+                break
             
             data = response.json()
 
@@ -130,19 +130,9 @@ def fetch_and_load_fda_data():
                 error_msg = data['error']
                 print(f"⚠️ Erro da API: {error_msg}")
                 if error_msg.get('code') == 'NOT_FOUND':
-                    print("ℹ️ Nenhum dado encontrado para os critérios.")
+                    print("ℹ️ Nenhum dado encontrado para este dia.")
                     break
                 else:
-                    # Tentar busca mais simples
-                    print("💡 Tentando busca sem filtro de data...")
-                    params_simple = {'limit': 10, 'sort': 'receivedate:desc'}
-                    response_simple = requests.get(API_BASE_URL, params=params_simple, timeout=30)
-                    if response_simple.status_code == 200:
-                        data_simple = response_simple.json()
-                        results = data_simple.get('results', [])
-                        if results:
-                            all_results.extend(results)
-                            print(f"📥 Encontrados {len(results)} registros recentes.")
                     break
 
             results = data.get('results', [])
@@ -152,40 +142,17 @@ def fetch_and_load_fda_data():
                 break
 
             all_results.extend(results)
-            total_records_fetched += len(results)
-            print(f"📥 Página {skip//50 + 1}: {len(results)} registros. Total: {total_records_fetched}")
+            print(f"📥 Página {skip//API_LIMIT + 1}: {len(results)} registros. Total: {len(all_results)}")
 
-            if len(results) < 50:
+            if len(results) < API_LIMIT:
                 print("✅ Última página alcançada.")
                 break
             
-            skip += 50
+            skip += API_LIMIT
 
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 500:
-                print("❌ Erro 500 - Servidor sobrecarregado.")
-                print("💡 Tentando abordagem alternativa...")
-                
-                # Abordagem alternativa: buscar apenas alguns registros recentes
-                params_alt = {
-                    'search': 'patient.drug.medicinalproduct:"aspirin"',
-                    'limit': 20,
-                    'sort': 'receivedate:desc'
-                }
-                try:
-                    response_alt = requests.get(API_BASE_URL, params=params_alt, timeout=30)
-                    if response_alt.status_code == 200:
-                        data_alt = response_alt.json()
-                        results_alt = data_alt.get('results', [])
-                        if results_alt:
-                            all_results.extend(results_alt)
-                            print(f"📥 Abordagem alternativa: {len(results_alt)} registros.")
-                except:
-                    pass
-                break
-            else:
-                print(f"❌ Erro HTTP: {e}")
-                break
+            print(f"❌ Erro HTTP: {e}")
+            break
         except Exception as e:
             print(f"❌ Erro: {e}")
             break
@@ -193,20 +160,20 @@ def fetch_and_load_fda_data():
     print(f"🎯 Busca finalizada. Total de {len(all_results)} registros brutos.")
 
     if not all_results:
-        print("⚠️ Nenhum dado retornado. Criando dados de teste...")
+        print("⚠️ Nenhum dado retornado para o dia especificado.")
         
         # Criar dados de teste para validar o pipeline
         test_data = [
             {
-                'safetyreportid': 'TEST_001',
-                'receivedate': '20230101',
+                'safetyreportid': f'TEST_{target_date.strftime("%Y%m%d")}_001',
+                'receivedate': start_date,
                 'serious': 1,
                 'patient_patientsex': 1,
                 'reactionmeddrapt': 'Headache'
             },
             {
-                'safetyreportid': 'TEST_002', 
-                'receivedate': '20230102',
+                'safetyreportid': f'TEST_{target_date.strftime("%Y%m%d")}_002',
+                'receivedate': start_date,
                 'serious': 0,
                 'patient_patientsex': 2,
                 'reactionmeddrapt': 'Nausea'
@@ -241,19 +208,50 @@ def fetch_and_load_fda_data():
             credentials = bq_hook.get_credentials()
             destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
 
+            # Schema explícito
+            table_schema = [
+                {"name": "safetyreportid", "type": "STRING"},
+                {"name": "receivedate", "type": "TIMESTAMP"},
+                {"name": "serious", "type": "INTEGER"},
+                {"name": "patient_patientsex", "type": "INTEGER"},
+                {"name": "reactionmeddrapt", "type": "STRING"}
+            ]
+
             df.to_gbq(
                 destination_table=destination_table,
                 project_id=GCP_PROJECT,
                 if_exists="append",
                 credentials=credentials,
+                table_schema=table_schema,
                 location=BQ_LOCATION,
                 progress_bar=False,
             )
             print(f"✅ Carga para BigQuery concluída! {len(df)} linhas carregadas.")
-            return f"Successfully loaded {len(df)} records"
+            return f"Successfully loaded {len(df)} records for date {start_date}"
             
         except Exception as e:
             print(f"❌ Erro no BigQuery: {e}")
+            # Verificar se a tabela existe, se não, criar primeiro
+            try:
+                # Tentar criar a tabela primeiro
+                test_df = pd.DataFrame([{
+                    'safetyreportid': 'INIT',
+                    'receivedate': pd.Timestamp.now(),
+                    'serious': 0,
+                    'patient_patientsex': 0,
+                    'reactionmeddrapt': 'INIT'
+                }])
+                test_df.to_gbq(
+                    destination_table=destination_table,
+                    project_id=GCP_PROJECT,
+                    if_exists="fail",
+                    credentials=credentials,
+                    table_schema=table_schema,
+                    location=BQ_LOCATION,
+                )
+                print("✅ Tabela criada com sucesso.")
+            except Exception as create_error:
+                print(f"❌ Erro ao criar tabela: {create_error}")
             raise
     else:
         print("⚠️ Nenhum dado para carregar.")
@@ -261,14 +259,14 @@ def fetch_and_load_fda_data():
 
 @dag(
     default_args=DEFAULT_ARGS,
-    dag_id='fda_aspirin_events_weekly',
-    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule='@weekly',
-    catchup=True,
+    dag_id='fda_aspirin_daily',
+    start_date=pendulum.datetime(2025, 9, 1, tz="UTC"),  # Começar em 01/09/2025
+    schedule='@daily',  # Executar diariamente
+    catchup=True,       # Processar dias passados
     max_active_runs=1,
-    tags=['fda', 'aspirin', 'bigquery', 'api'],
+    tags=['fda', 'aspirin', 'bigquery', 'daily'],
 )
-def fda_aspirin_events_dag():
+def fda_aspirin_daily_dag():
     fetch_and_load_fda_data()
 
-dag = fda_aspirin_events_dag()
+dag = fda_aspirin_daily_dag()
