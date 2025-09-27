@@ -1,4 +1,3 @@
-echo "# Trigger full deployment" >> requirements.txt
 pandas
 pandas-gbq>=0.19.2
 google-cloud-bigquery>=3.17.0
