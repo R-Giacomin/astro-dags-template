@@ -1,16 +1,20 @@
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
 from airflow.decorators import dag, task
-from airflow.utils.dates import days_ago
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+import pendulum
 
-# Configurações
+# ====== CONFIGURAÇÃO ======
 GCP_PROJECT = "gen-lang-client-0010767843"
 BQ_DATASET = "fda"
 BQ_TABLE = "fda_tobacco_events"
 BQ_LOCATION = "US"
+GCP_CONN_ID = "google_cloud_default"  # conexão GCP no Airflow
+# ==========================
 
-# Parâmetros da DAG
 default_args = {
     "owner": "airflow",
     "retries": 2,
@@ -20,21 +24,23 @@ default_args = {
     dag_id="fda_tobacco_monthly",
     default_args=default_args,
     schedule="@monthly",
-    start_date=datetime(2024, 1, 1),
+    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=True,
-    tags=["fda", "tobacco", "api", "monthly"],
+    max_active_runs=1,
+    tags=["fda", "tobacco", "api", "bigquery", "monthly"],
 )
 def fda_tobacco_dag():
 
     @task
-    def fetch_tobacco_reports_by_month(year: int, month: int):
-        from datetime import datetime as dt, timedelta
+    def fetch_tobacco_reports_by_month(**context):
+        year = context["logical_date"].year
+        month = context["logical_date"].month
 
-        start_date = dt(year, month, 1)
+        start_date = datetime(year, month, 1)
         if month == 12:
-            end_date = dt(year + 1, 1, 1)
+            end_date = datetime(year + 1, 1, 1)
         else:
-            end_date = dt(year, month + 1, 1)
+            end_date = datetime(year, month + 1, 1)
 
         current = start_date
         all_results = []
@@ -42,7 +48,7 @@ def fda_tobacco_dag():
         while current < end_date:
             date_str = current.strftime("%m/%d/%Y")
             query = f'date_submitted:"{date_str}"'
-            url = "https://api.fda.gov/tobacco/problem.json"
+            url = "https://api.fda.gov/tobacco/problem.json"  # sem espaços!
             params = {"search": query, "limit": 100}
 
             try:
@@ -55,14 +61,15 @@ def fda_tobacco_dag():
                 results = data.get("results", [])
                 all_results.extend(results)
             except requests.exceptions.RequestException:
-                pass  # ou log com logger
+                pass  # log opcional com logger
 
             current += timedelta(days=1)
 
         return all_results
 
     @task
-    def build_and_aggregate_dataframe(reports: list):
+    def process_and_load_to_bq(reports: list):
+        # === 1. Transformação ===
         rows = []
         for rep in reports:
             date_submitted = rep.get("date_submitted")
@@ -74,55 +81,58 @@ def fda_tobacco_dag():
                         "reported_health_problems": p,
                         "cases_number": 1
                     })
-        if not rows:
-            # Retorna DataFrame vazio com schema explícito
-            df = pd.DataFrame(columns=["date_submitted", "reported_health_problems", "cases_number"])
-        else:
-            df = pd.DataFrame(rows)
 
-        # Agregação
+        if not rows:
+            print("Nenhum dado para carregar neste mês.")
+            return
+
+        df = pd.DataFrame(rows)
         df_summary = (
             df.groupby(["date_submitted", "reported_health_problems"])
             .agg(cases_number=("cases_number", "sum"))
             .reset_index()
         )
 
-        # Converte para dict para XCom (JSON serializável)
-        return df_summary.to_dict(orient="records")
+        # Garantir que 'date_submitted' seja string (já está no formato MM/DD/YYYY)
+        df_summary["date_submitted"] = df_summary["date_submitted"].astype(str)
+        df_summary["reported_health_problems"] = df_summary["reported_health_problems"].astype(str)
+        df_summary["cases_number"] = df_summary["cases_number"].astype(int)
 
-    # Obter ano/mês da data de execução (data lógica do DAG)
-    @task
-    def get_year_month(**context):
-        logical_date = context["logical_date"]
-        return {"year": logical_date.year, "month": logical_date.month}
+        print(f"Pronto para carregar {len(df_summary)} registros no BigQuery.")
 
-    # Orquestração
-    year_month = get_year_month()
-    raw_reports = fetch_tobacco_reports_by_month(
-        year=year_month["year"],
-        month=year_month["month"]
-    )
-    aggregated_data = build_and_aggregate_dataframe(raw_reports)
+        # === 2. Credenciais do GCP ===
+        bq_hook = BigQueryHook(
+            gcp_conn_id=GCP_CONN_ID,
+            location=BQ_LOCATION,
+            use_legacy_sql=False
+        )
+        credentials = bq_hook.get_credentials()
 
-    # Salvar no BigQuery (comentei, mas deixei como exemplo)
-    @task
-    def save_to_bigquery(data: list):
-        from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-        df = pd.DataFrame(data)
-        hook = BigQueryHook(gcp_conn_id="google_cloud_default", location=BQ_LOCATION)
-        hook.insert_all(
+        # === 3. Schema explícito (opcional, mas recomendado) ===
+        table_schema = [
+            {"name": "date_submitted", "type": "STRING"},
+            {"name": "reported_health_problems", "type": "STRING"},
+            {"name": "cases_number", "type": "INTEGER"},
+        ]
+
+        destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+
+        # === 4. Carregar no BigQuery ===
+        df_summary.to_gbq(
+            destination_table=destination_table,
             project_id=GCP_PROJECT,
-            dataset_id=BQ_DATASET,
-            table_id=BQ_TABLE,
-            rows=df.to_dict(orient="records"),
-            ignore_unknown_values=True,
-            skip_invalid_rows=True
+            if_exists="append",
+            credentials=credentials,
+            table_schema=table_schema,
+            location=BQ_LOCATION,
+            progress_bar=False,
         )
 
-    save_to_bigquery(aggregated_data)
+        print(f"Carregado com sucesso {len(df_summary)} linhas em {GCP_PROJECT}.{destination_table}.")
 
-    # O resultado final está em `aggregated_data`, salvo automaticamente no XCom
-    return aggregated_data
+    # === Orquestração ===
+    raw_reports = fetch_tobacco_reports_by_month()
+    process_and_load_to_bq(raw_reports)
 
-# Instancia a DAG
-dag_instance = fda_tobacco_dag()
+# ⚠️ IMPORTANTE: variável global deve se chamar EXATAMENTE 'dag'
+dag = fda_tobacco_dag()
