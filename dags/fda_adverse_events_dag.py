@@ -7,14 +7,16 @@ import pandas as pd
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 # Configurações
-GCP_PROJECT = "gen-lang-client-0010767843" 
-BQ_DATASET  = "fda"     
-BQ_TABLE    = "fda_aspirin_events"
-BQ_LOCATION = "US"      
+GCP_PROJECT = "gen-lang-client-0010767843"
+BQ_DATASET = "fda"
+BQ_TABLE = "fda_aspirin_events"
+# ✅ CORREÇÃO: Usar a localização correta do BigQuery (seu projeto mostra 'US')
+BQ_LOCATION = "US" 
 GCP_CONN_ID = "google_cloud_default"
 
 API_BASE_URL = "https://api.fda.gov/drug/event.json"
-API_LIMIT = 50  # Reduzido para evitar sobrecarga
+API_LIMIT = 50  # Limite por requisição
+MAX_RECORDS_PER_RUN = 500 # Limite total por dia (ajuste se necessário)
 
 DEFAULT_ARGS = {
     "email_on_failure": True,
@@ -26,17 +28,21 @@ def extract_specific_fields(record):
     Extrai campos relevantes de um registro da FDA.
     """
     try:
+        # Tenta extrair 'reactionmeddrapt' de forma mais segura
+        reaction = record.get("patient", {}).get("reaction", [{}])
+        reactionmeddrapt = reaction[0].get("reactionmeddrapt", "") if reaction else ""
+        
         return {
             "safetyreportid": str(record.get("safetyreportid", "")),
-            "receivedate": record.get("receivedate"),  # será convertido depois
-            "serious": int(record.get("serious", 0)) if record.get("serious") else 0,
-            "patient_patientsex": int(record.get("patient", {}).get("patientsex", 0))
-                if "patient" in record else 0,
-            "reactionmeddrapt": (
-                record.get("patient", {})
-                      .get("reaction", [{}])[0]
-                      .get("reactionmeddrapt", "")
-            )
+            "receivedate": record.get("receivedate"),
+            # Converte para int de forma segura, tratando None/string vazia como 0
+            "serious": int(record.get("serious", 0)) if str(record.get("serious")).isdigit() else 0,
+            "patient_patientsex": (
+                int(record.get("patient", {}).get("patientsex", 0)) 
+                if "patient" in record and str(record["patient"].get("patientsex")).isdigit() 
+                else 0
+            ),
+            "reactionmeddrapt": reactionmeddrapt
         }
     except Exception as e:
         print(f"❌ Erro ao extrair campos: {e}")
@@ -45,7 +51,8 @@ def extract_specific_fields(record):
 @task
 def fetch_and_load_fda_data():
     ctx = get_current_context()
-    target_date = ctx["data_interval_start"]
+    # Usa data_interval_start para garantir que cada run processe um dia diferente
+    target_date = ctx["data_interval_start"] 
 
     start_date = target_date.strftime('%Y%m%d')
     end_date   = target_date.strftime('%Y%m%d')
@@ -54,21 +61,24 @@ def fetch_and_load_fda_data():
 
     all_results = []
     skip = 0
-    max_records = 500
 
     while True:
-        if skip >= max_records:
+        # Limite de segurança para evitar runs muito longas
+        if skip >= MAX_RECORDS_PER_RUN:
+            print(f"⚠️ Limite de {MAX_RECORDS_PER_RUN} registros atingido para o dia {start_date}.")
             break
 
         params = {
+            # Filtro de data correto, garantindo busca de um único dia por run
             "search": f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]',
-            "limit": 50,
+            "limit": API_LIMIT,
             "skip": skip
         }
 
         try:
             response = requests.get(API_BASE_URL, params=params, timeout=30)
-            print(f"📡 Request {skip//50 + 1}, status {response.status_code}")
+            print(f"📡 Request {skip//API_LIMIT + 1}, status {response.status_code}")
+            response.raise_for_status() # Lança erro para status codes 4xx/5xx
 
             data = response.json()
             results = data.get("results", [])
@@ -80,19 +90,25 @@ def fetch_and_load_fda_data():
 
             all_results.extend(results)
 
-            if len(results) < 50:
+            if len(results) < API_LIMIT:
                 break
 
-            skip += 50
+            skip += API_LIMIT
 
+        except requests.exceptions.HTTPError as http_err:
+            print(f"❌ Erro HTTP na requisição: {http_err}")
+            # Se for erro 404/400 (ex: data sem dados), pode continuar
+            if response.status_code in [404, 400]: 
+                break
+            raise # Relança outros erros
         except Exception as e:
             print(f"❌ Erro na requisição: {e}")
-            break
+            raise # Garante que o Airflow marque a tarefa como falha
 
     print(f"🎯 Total bruto coletado: {len(all_results)} registros")
 
     if not all_results:
-        print("⚠️ Nenhum dado retornado para esse dia.")
+        print(f"⚠️ Nenhum dado retornado para o dia {start_date}.")
         return "No data"
 
     extracted_data = [
@@ -103,121 +119,88 @@ def fetch_and_load_fda_data():
 
     df = pd.DataFrame(extracted_data)
 
-    # Converter tipos
-    if "receivedate" in df.columns:
-        df["receivedate"] = pd.to_datetime(df["receivedate"], format="%Y%m%d", errors="coerce")
-
-    print("👀 Preview do DataFrame:")
-    print(df.head())
-    print(df.dtypes)
-
-    # Processar e carregar para BigQuery
-    print("👀 Preview do DataFrame:")
-    print(df.head())
-    print(f"📊 Shape: {df.shape}")
-    print(f"🔧 Tipos de dados originais:")
-    print(df.dtypes)
+    # --- Pré-processamento e Limpeza de Tipos ---
     
-    # CORREÇÃO: Converter tipos de dados
+    # Função segura para conversão (mantida por segurança)
     def safe_convert_to_int(value):
-        """Converte valor para inteiro de forma segura"""
         try:
             if value is None or pd.isna(value):
                 return 0
+            # Tenta converter para float (para lidar com strings como '1.0') e depois para int
             return int(float(value))
         except (ValueError, TypeError):
             return 0
 
-    # Aplicar conversões
+    # Aplica conversões e limpeza
+    if 'receivedate' in df.columns:
+        # ✅ CORREÇÃO: Converte para datetime e normaliza para DATE (sem hora)
+        df['receivedate'] = pd.to_datetime(df['receivedate'], format='%Y%m%d', errors='coerce').dt.normalize()
+        # Remove linhas onde a data é crucial e está nula (NaT)
+        df = df.dropna(subset=['receivedate'])
+        
+    # Aplica conversões de int
     if 'serious' in df.columns:
         df['serious'] = df['serious'].apply(safe_convert_to_int)
-    
     if 'patient_patientsex' in df.columns:
         df['patient_patientsex'] = df['patient_patientsex'].apply(safe_convert_to_int)
     
-    if 'receivedate' in df.columns:
-        df['receivedate'] = pd.to_datetime(df['receivedate'], format='%Y%m%d', errors='coerce')
-    
+    # Aplica conversões de string
     if 'safetyreportid' in df.columns:
         df['safetyreportid'] = df['safetyreportid'].astype(str)
-    
     if 'reactionmeddrapt' in df.columns:
-        df['reactionmeddrapt'] = df['reactionmeddrapt'].astype(str)
+        df['reactionmeddrapt'] = df['reactionmeddrapt'].astype(str).str.strip().fillna("N/A")
 
     print(f"🔄 Tipos de dados após conversão:")
     print(df.dtypes)
-
-    # Remover linhas com valores críticos nulos
-    if not df.empty:
-        initial_count = len(df)
-        df = df.dropna(subset=['safetyreportid', 'receivedate'])
-        final_count = len(df)
-        print(f"📊 Linhas após limpeza: {final_count}/{initial_count}")
+    print(f"📊 Linhas para carregar após limpeza: {len(df)}")
 
     # Carregar para BigQuery
+    if df.empty:
+        print("🛑 DataFrame vazio após limpeza. Nada para carregar.")
+        return "No data after cleaning"
+        
     try:
         bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
         credentials = bq_hook.get_credentials()
         destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
 
-        # Schema explícito
+        # ✅ CORREÇÃO: Schema explícito com 'DATE' para 'receivedate'
         table_schema = [
             {"name": "safetyreportid", "type": "STRING"},
-            {"name": "receivedate", "type": "TIMESTAMP"},
+            {"name": "receivedate", "type": "DATE"}, 
             {"name": "serious", "type": "INTEGER"},
             {"name": "patient_patientsex", "type": "INTEGER"},
             {"name": "reactionmeddrapt", "type": "STRING"}
         ]
 
-        print(f"🚀 Carregando {len(df)} linhas para BigQuery...")
+        print(f"🚀 Carregando {len(df)} linhas para BigQuery em {destination_table}...")
         
         df.to_gbq(
             destination_table=destination_table,
             project_id=GCP_PROJECT,
-            if_exists="append",
+            if_exists="append", # Usa 'append' para adicionar dados diários
             credentials=credentials,
             table_schema=table_schema,
             location=BQ_LOCATION,
             progress_bar=False,
         )
         print(f"✅ Carga para BigQuery concluída! {len(df)} linhas carregadas.")
-        return f"Successfully loaded {len(df)} records"
+        return f"Successfully loaded {len(df)} records for {start_date}"
 
     except Exception as e:
-        print(f"❌ Erro no BigQuery: {e}")
-        
-        # Tentativa alternativa simplificada
-        try:
-            print("🔄 Tentando abordagem alternativa...")
-            # Criar um DataFrame mínimo
-            minimal_df = pd.DataFrame([{
-                'safetyreportid': 'MINIMAL_TEST',
-                'receivedate': pd.Timestamp.now(),
-                'serious': 1,
-                'patient_patientsex': 1,
-                'reactionmeddrapt': 'TEST'
-            }])
-            
-            minimal_df.to_gbq(
-                destination_table=destination_table,
-                project_id=GCP_PROJECT,
-                if_exists="append",
-                credentials=credentials,
-                location=BQ_LOCATION,
-            )
-            print("✅ Dados mínimos carregados para criar tabela.")
-            return "Minimal data loaded"
-            
-        except Exception as alt_error:
-            print(f"❌ Erro na abordagem alternativa: {alt_error}")
-            return f"Failed to load data: {str(alt_error)}"
+        # 🛑 REMOÇÃO DO BLOCO 'MINIMAL_TEST':
+        # Qualquer falha aqui agora resultará em uma falha da tarefa,
+        # expondo o erro real (ex: problema de permissão ou schema)
+        print(f"❌ Erro CRÍTICO no BigQuery. A tarefa irá falhar: {e}")
+        # Re-lança o erro para que o Airflow marque a tarefa como falha
+        raise e 
 
 @dag(
     default_args=DEFAULT_ARGS,
     dag_id='fda_aspirin_daily',
-    start_date=pendulum.datetime(2024, 10, 1, tz="UTC"),  # <-- aqui muda
+    start_date=pendulum.datetime(2024, 10, 1, tz="UTC"), 
     schedule='@daily',
-    catchup=True,
+    catchup=True, # Mantido para buscar dados históricos desde o start_date
     max_active_runs=1,
     tags=['fda', 'aspirin', 'bigquery', 'daily'],
 )
