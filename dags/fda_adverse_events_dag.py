@@ -59,148 +59,47 @@ def fetch_and_load_fda_data():
     """
     Busca dados de eventos adversos para Aspirin - UM DIA POR VEZ.
     """
-    ctx = get_current_context()
-
-    # 1. Usar APENAS UM DIA específico - 01/09/2025
-    target_date = pendulum.datetime(2025, 9, 1, tz="UTC")
-    
-    # Formato de data: AAAAMMDD (mesmo dia para início e fim)
-    start_date = target_date.strftime('%Y%m%d')
-    end_date = target_date.strftime('%Y%m%d')
-
-    print(f"🔍 Buscando dados do Aspirin para UM DIA: {start_date}")
-
-    all_results = []
-    skip = 0
-    max_records = 500  # Limite máximo
-
-    # 2. Loop de Paginação para um único dia
-    while True:
-        if skip >= max_records:
-            print(f"📊 Atingido o limite de {max_records} registros.")
-            break
-
-        # Query para UM DIA específico
-        search_query = f'patient.drug.medicinalproduct:"aspirin"+AND+receivedate:[{start_date}+TO+{end_date}]'
-        
-        params = {
-            'search': search_query,
-            'limit': API_LIMIT,
-            'skip': skip
-        }
-
-        try:
-            print(f"📡 Fazendo requisição {skip//API_LIMIT + 1}...")
-            print(f"🔍 Query: {search_query}")
-            
-            response = requests.get(API_BASE_URL, params=params, timeout=30)
-            print(f"📊 Status Code: {response.status_code}")
-            
-            if response.status_code == 500:
-                print("❌ Erro 500 - Tentando com abordagem mais simples...")
-                
-                # Tentar sem filtro de data, apenas aspirin
-                search_query_simple = 'patient.drug.medicinalproduct:"aspirin"'
-                params_simple = {
-                    'search': search_query_simple,
-                    'limit': 10,  # Apenas 10 registros
-                    'skip': skip
-                }
-                
-                response_simple = requests.get(API_BASE_URL, params=params_simple, timeout=30)
-                if response_simple.status_code == 200:
-                    data_simple = response_simple.json()
-                    results = data_simple.get('results', [])
-                    if results:
-                        all_results.extend(results)
-                        print(f"📥 Encontrados {len(results)} registros (abordagem simples).")
-                        break
-                else:
-                    print("❌ Abordagem simples também falhou.")
-                    break
-                    
-            elif response.status_code != 200:
-                print(f"❌ Erro HTTP {response.status_code}")
-                break
-            
-            data = response.json()
-
-            # Verificar se há erro
-            if 'error' in data:
-                error_msg = data['error']
-                print(f"⚠️ Erro da API: {error_msg}")
-                if error_msg.get('code') == 'NOT_FOUND':
-                    print("ℹ️ Nenhum dado encontrado para este dia.")
-                    break
-                else:
-                    break
-
-            results = data.get('results', [])
-            
-            if not results:
-                print("✅ Nenhum resultado adicional encontrado.")
-                break
-
-            all_results.extend(results)
-            print(f"📥 Página {skip//API_LIMIT + 1}: {len(results)} registros. Total: {len(all_results)}")
-
-            if len(results) < API_LIMIT:
-                print("✅ Última página alcançada.")
-                break
-            
-            skip += API_LIMIT
-
-        except requests.exceptions.HTTPError as e:
-            print(f"❌ Erro HTTP: {e}")
-            break
-        except Exception as e:
-            print(f"❌ Erro: {e}")
-            break
-
-    print(f"🎯 Busca finalizada. Total de {len(all_results)} registros brutos.")
-
-    if not all_results:
-        print("⚠️ Nenhum dado retornado para o dia especificado.")
-        
-        # Criar dados de teste para validar o pipeline
-        test_data = [
-            {
-                'safetyreportid': f'TEST_{target_date.strftime("%Y%m%d")}_001',
-                'receivedate': start_date,
-                'serious': 1,
-                'patient_patientsex': 1,
-                'reactionmeddrapt': 'Headache'
-            },
-            {
-                'safetyreportid': f'TEST_{target_date.strftime("%Y%m%d")}_002',
-                'receivedate': start_date,
-                'serious': 0,
-                'patient_patientsex': 2,
-                'reactionmeddrapt': 'Nausea'
-            }
-        ]
-        df = pd.DataFrame(test_data)
-        print("🧪 Usando dados de teste para validar o pipeline.")
-        
-    else:
-        # Processar dados reais
-        extracted_data = []
-        for record in all_results:
-            extracted_record = extract_specific_fields(record)
-            if extracted_record:
-                extracted_data.append(extracted_record)
-        
-        df = pd.DataFrame(extracted_data)
-        print(f"📊 Extraídos {len(df)} registros com colunas específicas.")
+    # ... (código anterior até a extração dos dados) ...
 
     # Processar e carregar para BigQuery
     if not df.empty:
         print("👀 Preview do DataFrame:")
         print(df.head())
+        print(f"📊 Tipos de dados originais:")
+        print(df.dtypes)
         
-        # Processar datas
+        # CORREÇÃO CRÍTICA: Converter tipos de dados antes do BigQuery
+        if 'serious' in df.columns:
+            # Converter para inteiro, tratando valores ausentes
+            df['serious'] = pd.to_numeric(df['serious'], errors='coerce').fillna(0).astype(int)
+        
+        if 'patient_patientsex' in df.columns:
+            # Converter para inteiro, tratando valores ausentes
+            df['patient_patientsex'] = pd.to_numeric(df['patient_patientsex'], errors='coerce').fillna(0).astype(int)
+        
         if 'receivedate' in df.columns:
+            # Converter para datetime
             df['receivedate'] = pd.to_datetime(df['receivedate'], format='%Y%m%d', errors='coerce')
+        
+        # Garantir que safetyreportid e reactionmeddrapt sejam strings
+        if 'safetyreportid' in df.columns:
+            df['safetyreportid'] = df['safetyreportid'].astype(str)
+        
+        if 'reactionmeddrapt' in df.columns:
+            df['reactionmeddrapt'] = df['reactionmeddrapt'].astype(str)
+        
+        print(f"🔄 Tipos de dados após conversão:")
+        print(df.dtypes)
+        
+        # Remover linhas com valores críticos nulos
+        initial_count = len(df)
+        df = df.dropna(subset=['safetyreportid', 'receivedate'])
+        final_count = len(df)
+        print(f"📊 Linhas após limpeza: {final_count}/{initial_count}")
+        
+        if df.empty:
+            print("⚠️ Nenhuma linha válida após limpeza.")
+            return "No valid data to load"
         
         # Carregar para BigQuery
         try:
@@ -217,6 +116,8 @@ def fetch_and_load_fda_data():
                 {"name": "reactionmeddrapt", "type": "STRING"}
             ]
 
+            print(f"🚀 Carregando {len(df)} linhas para BigQuery...")
+            
             df.to_gbq(
                 destination_table=destination_table,
                 project_id=GCP_PROJECT,
@@ -231,28 +132,50 @@ def fetch_and_load_fda_data():
             
         except Exception as e:
             print(f"❌ Erro no BigQuery: {e}")
-            # Verificar se a tabela existe, se não, criar primeiro
+            
+            # Tentativa alternativa: criar tabela primeiro com uma linha
             try:
-                # Tentar criar a tabela primeiro
-                test_df = pd.DataFrame([{
+                print("🔄 Tentando criar tabela primeiro...")
+                sample_data = [{
                     'safetyreportid': 'INIT',
-                    'receivedate': pd.Timestamp.now(),
+                    'receivedate': pd.Timestamp('2025-09-01'),
                     'serious': 0,
                     'patient_patientsex': 0,
                     'reactionmeddrapt': 'INIT'
-                }])
-                test_df.to_gbq(
+                }]
+                sample_df = pd.DataFrame(sample_data)
+                
+                # Garantir tipos corretos no sample
+                sample_df['serious'] = sample_df['serious'].astype(int)
+                sample_df['patient_patientsex'] = sample_df['patient_patientsex'].astype(int)
+                sample_df['safetyreportid'] = sample_df['safetyreportid'].astype(str)
+                sample_df['reactionmeddrapt'] = sample_df['reactionmeddrapt'].astype(str)
+                
+                sample_df.to_gbq(
                     destination_table=destination_table,
                     project_id=GCP_PROJECT,
-                    if_exists="fail",
+                    if_exists="fail",  # Falha se a tabela já existe
                     credentials=credentials,
                     table_schema=table_schema,
                     location=BQ_LOCATION,
                 )
-                print("✅ Tabela criada com sucesso.")
+                print("✅ Tabela criada com sucesso. Tentando novamente...")
+                
+                # Agora tentar carregar os dados reais
+                df.to_gbq(
+                    destination_table=destination_table,
+                    project_id=GCP_PROJECT,
+                    if_exists="append",
+                    credentials=credentials,
+                    table_schema=table_schema,
+                    location=BQ_LOCATION,
+                )
+                print(f"✅ Dados carregados após criação da tabela! {len(df)} linhas.")
+                return f"Successfully loaded {len(df)} records"
+                
             except Exception as create_error:
                 print(f"❌ Erro ao criar tabela: {create_error}")
-            raise
+                raise
     else:
         print("⚠️ Nenhum dado para carregar.")
         return "No data to load"
