@@ -76,8 +76,9 @@ def fetch_and_load_tobacco_data():
             response = requests.get(API_BASE_URL, params=params, timeout=30)
             print(f"📡 Request {skip//API_LIMIT + 1}, status {response.status_code}")
 
-            if response.status_code in [404, 400]:
-                print(f"🔎 Status {response.status_code}: Sem dados.")
+            # 👉 Tratar 400, 404 e 500 como "sem dados"
+            if response.status_code in [400, 404, 500]:
+                print(f"🔎 Status {response.status_code}: Sem dados para {start_date}.")
                 break
 
             response.raise_for_status()
